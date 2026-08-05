@@ -117,6 +117,18 @@ export interface TuiAltScreenOptions {
 	openUrl?: (url: string) => void;
 }
 
+export interface TuiReservedSidebarOptions {
+	width?: number;
+	minTerminalWidth?: number;
+	minMainWidth?: number;
+	divider?: string;
+}
+
+interface TuiReservedSidebarState {
+	component: Component;
+	options: Required<TuiReservedSidebarOptions>;
+}
+
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
 export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	readonly mode = "fullscreen" as const;
@@ -152,6 +164,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly wheelScrollLines: number;
 	private readonly mouseEnabled: boolean;
 	private readonly openUrl?: (url: string) => void;
+	private reservedSidebar?: TuiReservedSidebarState;
 
 	constructor(
 		terminal: Terminal,
@@ -187,6 +200,21 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.layoutRoot = component;
 		this.currentLayout = undefined;
 		this.requestRender();
+	}
+
+	setReservedSidebar(component: Component | undefined, options: TuiReservedSidebarOptions = {}): void {
+		this.reservedSidebar = component
+			? {
+					component,
+					options: {
+						width: Math.max(24, Math.floor(options.width ?? 42)),
+						minTerminalWidth: Math.max(80, Math.floor(options.minTerminalWidth ?? 140)),
+						minMainWidth: Math.max(40, Math.floor(options.minMainWidth ?? 80)),
+						divider: options.divider ?? "│",
+					},
+				}
+			: undefined;
+		this.requestRender(true);
 	}
 
 	override render(width: number): string[] {
@@ -957,13 +985,50 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return result;
 	}
 
+	private getReservedSidebarLayout(width: number): { state: TuiReservedSidebarState; mainWidth: number } | undefined {
+		const state = this.reservedSidebar;
+		if (!state || width < state.options.minTerminalWidth) return undefined;
+		const availableForPanel = width - state.options.minMainWidth - 3;
+		if (availableForPanel < 24) return undefined;
+		const panelWidth = Math.min(state.options.width, availableForPanel);
+		return { state, mainWidth: width - panelWidth - 3 };
+	}
+
+	private compositeReservedSidebar(
+		screen: string[],
+		state: TuiReservedSidebarState,
+		mainWidth: number,
+		width: number,
+		height: number,
+	): string[] {
+		const panelWidth = width - mainWidth - 3;
+		const left =
+			screen.length > height ? screen.slice(-height) : [...Array(height - screen.length).fill(""), ...screen];
+		const right = state.component.render(panelWidth).slice(0, height);
+		return left.map((line, row) => {
+			if (isImageLine(line)) return line;
+			const clippedLeft =
+				visibleWidth(line) > mainWidth
+					? sliceByColumn(line, 0, mainWidth, true)
+					: line + " ".repeat(mainWidth - visibleWidth(line));
+			const panelLine = right[row] ?? "";
+			const clippedRight =
+				visibleWidth(panelLine) > panelWidth
+					? sliceByColumn(panelLine, 0, panelWidth, true)
+					: panelLine + " ".repeat(panelWidth - visibleWidth(panelLine));
+			return `${clippedLeft} ${state.options.divider} ${clippedRight}`;
+		});
+	}
+
 	protected override doRender(): void {
 		if (this.stopped || !this.altScreenActive) return;
 		const width = Math.max(1, this.terminal.columns);
 		const height = Math.max(1, this.terminal.rows);
 		const root = this.layoutRoot ?? this.implicitScrollView;
-		const nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
+		const sidebar = this.getReservedSidebarLayout(width);
+		const nextLayout = renderLayoutFrame(root, sidebar?.mainWidth ?? width, height, () => this.requestRender());
 		let screen = nextLayout.lines.map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+		if (sidebar) screen = this.compositeReservedSidebar(screen, sidebar.state, sidebar.mainWidth, width, height);
 		screen = this.compositeOverlays(screen, width, height);
 		if (screen.length > height) screen = screen.slice(screen.length - height);
 		screen = this.applySelection(screen, nextLayout);

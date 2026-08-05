@@ -72,6 +72,47 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("renders a reserved sidebar without bypassing fullscreen layout", async () => {
+		const terminal = new VirtualTerminal(120, 4);
+		const tui = new TuiAltScreen(terminal);
+		let mainRenderWidth = 0;
+		tui.setLayoutRoot({
+			render: (width) => {
+				mainRenderWidth = width;
+				return [`main:${width}`];
+			},
+			invalidate: () => {},
+		});
+		tui.setReservedSidebar(new Text("WORKFLOWS\nrunning", 0, 0), {
+			width: 24,
+			minTerminalWidth: 40,
+			minMainWidth: 20,
+			divider: "|",
+		});
+		tui.start();
+		await terminal.waitForRender();
+
+		assert.strictEqual(mainRenderWidth, 93);
+		assert.deepStrictEqual(
+			terminal.getViewport().map((line) => line.trimEnd()),
+			[
+				`main:93${" ".repeat(86)} | WORKFLOWS`,
+				`${" ".repeat(93)} | running`,
+				`${" ".repeat(93)} |`,
+				`${" ".repeat(93)} |`,
+			],
+		);
+
+		tui.setReservedSidebar(undefined);
+		await terminal.waitForRender();
+		assert.strictEqual(mainRenderWidth, 120);
+		assert.deepStrictEqual(
+			terminal.getViewport().map((line) => line.trimEnd()),
+			["main:120", "", "", ""],
+		);
+		tui.stop();
+	});
+
 	it("keeps an explicit dock fixed while the transcript scrolls", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiAltScreen(terminal);

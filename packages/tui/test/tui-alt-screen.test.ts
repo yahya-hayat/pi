@@ -13,6 +13,7 @@ import {
 	setCapabilities,
 } from "../src/terminal-image.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
+import { wrapTextWithAnsi } from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -712,6 +713,89 @@ describe("TuiAltScreen", () => {
 		assert.ok(
 			terminal.events.some((event) => event.type === "write" && event.data.includes("\x1b[7m\x1b[0m\x1b[7m")),
 			"selection inverse must be reapplied after layout segment resets",
+		);
+		assert.ok(terminal.getViewport().some((line) => line.includes("Copied!")));
+
+		tui.stop();
+	});
+
+	it("copies soft-wrapped ANSI and Unicode text as logical lines", async () => {
+		const terminal = new RecordingTerminal(12, 3);
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild({
+			render: (width) =>
+				wrapTextWithAnsi("\x1b[31malpha βeta gamma\x1b[0m\nhard newline", width, { markSoftWraps: true }),
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+		assert.deepStrictEqual(
+			terminal.getViewport().map((line) => line.trimEnd()),
+			["alpha βeta", "gamma", "hard newline"],
+		);
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;12;3M");
+		terminal.sendInput("\x1b[<0;12;3m");
+		await terminal.waitForRender();
+
+		const expectedText = "alpha βeta gamma\nhard newline";
+		const expectedClipboardSequence = `\x1b]52;c;${Buffer.from(expectedText).toString("base64")}\x07`;
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes(expectedClipboardSequence)),
+			JSON.stringify(terminal.events.filter((event) => event.type === "write" && event.data.includes("\x1b]52;c;"))),
+		);
+		tui.stop();
+	});
+
+	it("extends a triple-click selection by logical lines", async () => {
+		const terminal = new RecordingTerminal(10, 5);
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild({
+			render: (width) => wrapTextWithAnsi("alpha beta gamma\nsecond line\nthird", width, { markSoftWraps: true }),
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<0;2;1m");
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<0;2;1m");
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<32;2;4M");
+		terminal.sendInput("\x1b[<0;2;4m");
+		await terminal.waitForRender();
+
+		const expectedClipboardSequence = `\x1b]52;c;${Buffer.from("alpha beta gamma\nsecond line").toString("base64")}\x07`;
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes(expectedClipboardSequence)),
+			JSON.stringify(terminal.events.filter((event) => event.type === "write" && event.data.includes("\x1b]52;c;"))),
+		);
+		tui.stop();
+	});
+
+	it("selects and copies a word on double-click", async () => {
+		const terminal = new RecordingTerminal(20, 2);
+		const tui = new TuiAltScreen(terminal);
+		tui.addChild(new Text("alpha \x1b[31mbeta\x1b[0m gamma", 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;8;1M");
+		terminal.sendInput("\x1b[<0;8;1m");
+		terminal.sendInput("\x1b[<0;8;1M");
+		terminal.sendInput("\x1b[<0;8;1m");
+		await terminal.waitForRender();
+
+		const expectedClipboardSequence = `\x1b]52;c;${Buffer.from("beta").toString("base64")}\x07`;
+		const clipboardWrites = terminal.events.filter(
+			(event) => event.type === "write" && event.data.includes("\x1b]52;c;"),
+		);
+		assert.strictEqual(
+			clipboardWrites.filter((event) => event.type === "write" && event.data.includes(expectedClipboardSequence))
+				.length,
+			1,
 		);
 		assert.ok(terminal.getViewport().some((line) => line.includes("Copied!")));
 

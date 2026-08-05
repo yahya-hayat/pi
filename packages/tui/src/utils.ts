@@ -310,6 +310,32 @@ export function stripTerminalSequences(str: string): string {
 	return result;
 }
 
+const SOFT_WRAP_MARKER_PREFIX = "\x1b_pi:soft-wrap:";
+const SOFT_WRAP_MARKER_REGEX = /\x1b_pi:soft-wrap:([^\x07\x1b]*)\x07/g;
+
+function createSoftWrapMarker(separator: string): string {
+	return `${SOFT_WRAP_MARKER_PREFIX}${encodeURIComponent(separator)}\x07`;
+}
+
+/** Return the source separator before a metadata-marked soft continuation line. */
+export function getSoftWrapSeparator(line: string): string | undefined {
+	const markerStart = line.indexOf(SOFT_WRAP_MARKER_PREFIX);
+	if (markerStart === -1) return undefined;
+	const payloadStart = markerStart + SOFT_WRAP_MARKER_PREFIX.length;
+	const payloadEnd = line.indexOf("\x07", payloadStart);
+	if (payloadEnd === -1) return undefined;
+	try {
+		return decodeURIComponent(line.slice(payloadStart, payloadEnd));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Remove application-only soft-wrap metadata before writing a line to the terminal. */
+export function stripSoftWrapMarkers(line: string): string {
+	return line.includes(SOFT_WRAP_MARKER_PREFIX) ? line.replace(SOFT_WRAP_MARKER_REGEX, "") : line;
+}
+
 interface GraphemeCellRange {
 	start: number;
 	end: number;
@@ -795,6 +821,11 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 	return tokens;
 }
 
+export interface WrapTextWithAnsiOptions {
+	/** Attach zero-width metadata to continuation rows so copy operations can reconstruct logical lines. */
+	markSoftWraps?: boolean;
+}
+
 /**
  * Wrap text with ANSI codes preserved.
  *
@@ -804,9 +835,10 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  *
  * @param text - Text to wrap (may contain ANSI codes and newlines)
  * @param width - Maximum visible width per line
+ * @param options - Optional soft-wrap metadata behavior
  * @returns Array of wrapped lines (NOT padded to width)
  */
-export function wrapTextWithAnsi(text: string, width: number): string[] {
+export function wrapTextWithAnsi(text: string, width: number, options: WrapTextWithAnsiOptions = {}): string[] {
 	if (!text) {
 		return [""];
 	}
@@ -821,8 +853,25 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
 		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
-		for (const wrappedLine of wrappedLines) {
-			result.push(wrappedLine);
+		if (options.markSoftWraps && wrappedLines.length > 1) {
+			const sourceText = stripTerminalSequences(inputLine);
+			let sourceOffset = 0;
+			for (let index = 0; index < wrappedLines.length; index++) {
+				const wrappedLine = wrappedLines[index]!;
+				const plainLine = stripTerminalSequences(wrappedLine);
+				const lineOffset = sourceText.indexOf(plainLine, sourceOffset);
+				if (lineOffset === -1) {
+					result.push(index === 0 ? wrappedLine : createSoftWrapMarker("") + wrappedLine);
+					continue;
+				}
+				const separator = sourceText.slice(sourceOffset, lineOffset);
+				result.push(index === 0 ? wrappedLine : createSoftWrapMarker(separator) + wrappedLine);
+				sourceOffset = lineOffset + plainLine.length;
+			}
+		} else {
+			for (const wrappedLine of wrappedLines) {
+				result.push(wrappedLine);
+			}
 		}
 		// Update tracker with codes from this line for next iteration
 		updateTrackerFromText(inputLine, tracker);

@@ -50,6 +50,7 @@ export class UserMessageComponent extends Container {
 				{
 					preserveOrderedListMarkers: true,
 					preserveBackslashEscapes: true,
+					markSoftWraps: true,
 					transform: createMarkdownTransform("user", false, this.markdownTransformers),
 				},
 			),

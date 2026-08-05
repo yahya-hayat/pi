@@ -35,6 +35,8 @@ import {
 	extractAnsiCode,
 	getGraphemeCellRange,
 	getOsc8LinkAtColumn,
+	getSoftWrapSeparator,
+	getWordSegmenter,
 	sliceByColumn,
 	stripTerminalSequences,
 	visibleWidth,
@@ -53,6 +55,7 @@ const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
 const OSC133_PROMPT_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
 const PAGE_SCROLL_OVERLAP = 4;
+const MULTI_CLICK_INTERVAL_MS = 500;
 const MAX_CACHED_OFFSCREEN_KITTY_IMAGES = 16;
 const MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES = 32 * 1024 * 1024;
 const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
@@ -67,6 +70,19 @@ interface SelectionPoint {
 	row: number;
 	col: number;
 	scrollView?: ScrollView;
+}
+
+type SelectionMode = "character" | "word" | "line";
+
+interface SelectionRange {
+	start: SelectionPoint;
+	end: SelectionPoint;
+}
+
+interface CompletedPrimaryClick {
+	point: SelectionPoint;
+	completedAt: number;
+	count: number;
 }
 
 interface SgrMouseEvent {
@@ -128,6 +144,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private scrollbarHover?: ScrollView;
 	private pressedUrl?: string;
 	private selectionDragged = false;
+	private selectionMode: SelectionMode = "character";
+	private selectionInitialRange?: SelectionRange;
+	private selectionPressPoint?: SelectionPoint;
+	private activeClickCount = 1;
+	private lastPrimaryClick?: CompletedPrimaryClick;
 	private readonly wheelScrollLines: number;
 	private readonly mouseEnabled: boolean;
 	private readonly openUrl?: (url: string) => void;
@@ -200,6 +221,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.selectionFocus = undefined;
 		this.pressedUrl = undefined;
 		this.selectionDragged = false;
+		this.selectionMode = "character";
+		this.selectionInitialRange = undefined;
+		this.selectionPressPoint = undefined;
+		this.activeClickCount = 1;
+		this.lastPrimaryClick = undefined;
 		this.resetRenderState();
 		this.terminal.write(
 			`${ENTER_ALT_SCREEN}${DISABLE_AUTOWRAP}${this.mouseEnabled ? ENABLE_MOUSE : ""}\x1b[2J\x1b[H\x1b[?25l`,
@@ -348,6 +374,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			this.stopScrollbarDrag();
 			this.pressedUrl = undefined;
 			this.selectionDragged = false;
+			this.selectionMode = "character";
+			this.selectionInitialRange = undefined;
+			this.selectionPressPoint = undefined;
+			this.activeClickCount = 1;
+			this.lastPrimaryClick = undefined;
 			if (hadActiveSelection) {
 				this.selectionAnchor = undefined;
 				this.selectionFocus = undefined;
@@ -520,6 +551,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.selectionFocus = undefined;
 		this.pressedUrl = undefined;
 		this.selectionDragged = false;
+		this.selectionMode = "character";
+		this.selectionInitialRange = undefined;
+		this.selectionPressPoint = undefined;
+		this.activeClickCount = 1;
+		this.lastPrimaryClick = undefined;
 		this.setScrollbarHover(target.scrollView);
 		this.scrollbarDrag = {
 			scrollView: target.scrollView,
@@ -605,7 +641,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			return;
 		}
 		const point = this.getScrollSelectionPoint(scrollView, pointer.x, pointer.y);
-		if (point) this.selectionFocus = point;
+		if (point) this.updateSelectionForMode(point);
 		this.requestRender();
 	}
 
@@ -618,6 +654,69 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.selectionDragPointer = undefined;
 	}
 
+	private isSameSelectionPoint(left: SelectionPoint, right: SelectionPoint): boolean {
+		return left.row === right.row && left.col === right.col && left.scrollView === right.scrollView;
+	}
+
+	private getSelectionSourceLines(point: SelectionPoint): readonly string[] | undefined {
+		if (!point.scrollView) return this.previousScreen;
+		if (!this.currentLayout) return undefined;
+		return getScrollViewBox(this.currentLayout, point.scrollView)?.scrollContentLines;
+	}
+
+	private getWordSelection(point: SelectionPoint): SelectionRange | undefined {
+		const sourceLines = this.getSelectionSourceLines(point);
+		const plainLine = stripTerminalSequences(sourceLines?.[point.row] ?? "");
+		for (const segment of getWordSegmenter().segment(plainLine)) {
+			const startColumn = visibleWidth(plainLine.slice(0, segment.index));
+			const endColumn = startColumn + visibleWidth(segment.segment);
+			if (point.col < startColumn || point.col >= endColumn) continue;
+			if (segment.segment.trim().length === 0 || endColumn <= startColumn) return undefined;
+			return {
+				start: { ...point, col: startColumn },
+				end: { ...point, col: endColumn - 1 },
+			};
+		}
+		return undefined;
+	}
+
+	private getLogicalLineSelection(point: SelectionPoint): SelectionRange | undefined {
+		const sourceLines = this.getSelectionSourceLines(point);
+		if (!sourceLines || point.row < 0 || point.row >= sourceLines.length) return undefined;
+		let startRow = point.row;
+		while (startRow > 0 && getSoftWrapSeparator(sourceLines[startRow] ?? "") !== undefined) startRow--;
+		let endRow = point.row;
+		while (endRow + 1 < sourceLines.length && getSoftWrapSeparator(sourceLines[endRow + 1] ?? "") !== undefined) {
+			endRow++;
+		}
+		return {
+			start: { ...point, row: startRow, col: 0 },
+			end: { ...point, row: endRow, col: Math.max(0, visibleWidth(sourceLines[endRow] ?? "") - 1) },
+		};
+	}
+
+	private isSelectionPointBefore(left: SelectionPoint, right: SelectionPoint): boolean {
+		return left.row < right.row || (left.row === right.row && left.col < right.col);
+	}
+
+	private updateSelectionForMode(point: SelectionPoint): void {
+		if (this.selectionMode === "character") {
+			this.selectionFocus = point;
+			return;
+		}
+		const targetRange =
+			this.selectionMode === "word" ? this.getWordSelection(point) : this.getLogicalLineSelection(point);
+		const initialRange = this.selectionInitialRange;
+		if (!targetRange || !initialRange) return;
+		if (this.isSelectionPointBefore(targetRange.start, initialRange.start)) {
+			this.selectionAnchor = initialRange.end;
+			this.selectionFocus = targetRange.start;
+		} else {
+			this.selectionAnchor = initialRange.start;
+			this.selectionFocus = targetRange.end;
+		}
+	}
+
 	private handleSelectionMouseEvent(event: SgrMouseEvent): void {
 		if ((event.button & 3) !== 0) return;
 		const anchorScrollView = this.selectionAnchor?.scrollView;
@@ -627,18 +726,20 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			this.selectionPressActive = false;
 			this.stopSelectionAutoScroll();
 			if (!this.selectionAnchor) return;
-			this.selectionFocus = point;
-			const clickedUrl =
+			this.updateSelectionForMode(point);
+			const completedClick =
 				!this.selectionDragged &&
-				this.selectionAnchor.scrollView === point.scrollView &&
-				this.selectionAnchor.row === point.row &&
-				this.selectionAnchor.col === point.col
-					? this.pressedUrl
-					: undefined;
+				this.selectionPressPoint !== undefined &&
+				this.isSameSelectionPoint(this.selectionPressPoint, point);
+			const clickedUrl = completedClick && this.activeClickCount === 1 ? this.pressedUrl : undefined;
 			this.pressedUrl = undefined;
 			if (clickedUrl && this.openUrl) {
 				this.selectionAnchor = undefined;
 				this.selectionFocus = undefined;
+				this.selectionMode = "character";
+				this.selectionInitialRange = undefined;
+				this.selectionPressPoint = undefined;
+				this.lastPrimaryClick = undefined;
 				try {
 					this.openUrl(clickedUrl);
 				} catch {
@@ -647,6 +748,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				this.requestRender();
 				return;
 			}
+			this.lastPrimaryClick =
+				completedClick && this.activeClickCount < 3
+					? { point, completedAt: Date.now(), count: this.activeClickCount }
+					: undefined;
 			this.copySelectionToClipboard();
 			this.requestRender();
 			return;
@@ -654,8 +759,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if ((event.button & 32) !== 0) {
 			if (!this.selectionPressActive || !this.selectionAnchor) return;
 			this.selectionDragged = true;
+			this.lastPrimaryClick = undefined;
 			this.pressedUrl = undefined;
-			this.selectionFocus = point;
+			this.updateSelectionForMode(point);
 			this.updateSelectionAutoScroll(event);
 			this.requestRender();
 			return;
@@ -667,13 +773,33 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				? getScrollViewsAt(this.currentLayout, event.x, event.y)[0]
 				: undefined;
 		const anchor = this.getSelectionPoint(event, scrollView);
-		this.selectionAnchor = anchor;
-		this.selectionFocus = anchor;
+		const now = Date.now();
+		const previousClick = this.lastPrimaryClick;
+		const continuesClickSequence =
+			previousClick !== undefined &&
+			now - previousClick.completedAt <= MULTI_CLICK_INTERVAL_MS &&
+			this.isSameSelectionPoint(previousClick.point, anchor);
+		this.activeClickCount = continuesClickSequence ? Math.min(3, previousClick.count + 1) : 1;
+		this.lastPrimaryClick = undefined;
+		this.selectionMode = this.activeClickCount === 2 ? "word" : this.activeClickCount >= 3 ? "line" : "character";
+		const initialRange =
+			this.selectionMode === "word"
+				? (this.getWordSelection(anchor) ?? { start: anchor, end: anchor })
+				: this.selectionMode === "line"
+					? (this.getLogicalLineSelection(anchor) ?? { start: anchor, end: anchor })
+					: { start: anchor, end: anchor };
+		this.selectionInitialRange = initialRange;
+		this.selectionPressPoint = anchor;
+		this.selectionAnchor = initialRange.start;
+		this.selectionFocus = initialRange.end;
 		this.selectionDragged = false;
-		this.pressedUrl = getOsc8LinkAtColumn(
-			this.previousScreen[Math.max(0, Math.min(this.terminal.rows - 1, event.y))] ?? "",
-			Math.max(0, Math.min(this.terminal.columns - 1, event.x)),
-		);
+		this.pressedUrl =
+			this.selectionMode === "character"
+				? getOsc8LinkAtColumn(
+						this.previousScreen[Math.max(0, Math.min(this.terminal.rows - 1, event.y))] ?? "",
+						Math.max(0, Math.min(this.terminal.columns - 1, event.x)),
+					)
+				: undefined;
 		this.requestRender();
 	}
 
@@ -684,6 +810,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			this.selectionAnchor.row < this.selectionFocus.row ||
 			(this.selectionAnchor.row === this.selectionFocus.row && this.selectionAnchor.col < this.selectionFocus.col);
 		if (
+			this.selectionMode === "character" &&
 			this.selectionAnchor.row === this.selectionFocus.row &&
 			this.selectionAnchor.col === this.selectionFocus.col
 		) {
@@ -723,17 +850,24 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			if (!box?.scrollContentLines) return;
 			sourceLines = box.scrollContentLines;
 		}
-		const lines: string[] = [];
+		let text = "";
 		for (let row = selection.start.row; row <= selection.end.row; row++) {
 			const line = sourceLines[row] ?? "";
 			const columns = this.getSelectionColumns(line, row, selection);
-			lines.push(
-				stripTerminalSequences(
-					sliceByColumn(line, columns.start, Math.max(0, columns.end - columns.start), true),
-				).trimEnd(),
-			);
+			let fragment = stripTerminalSequences(
+				sliceByColumn(line, columns.start, Math.max(0, columns.end - columns.start), true),
+			).trimEnd();
+			if (row > selection.start.row) {
+				const softWrapSeparator = getSoftWrapSeparator(line);
+				if (softWrapSeparator === undefined) {
+					text += "\n";
+				} else {
+					text += softWrapSeparator;
+					fragment = fragment.trimStart();
+				}
+			}
+			text += fragment;
 		}
-		const text = lines.join("\n");
 		if (text.length === 0) return;
 		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
 		this.flash("Copied!");

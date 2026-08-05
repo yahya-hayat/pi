@@ -109,6 +109,7 @@ export class AssistantMessageComponent extends Container {
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				this.contentContainer.addChild(
 					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
+						markSoftWraps: true,
 						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
 					}),
 				);
@@ -154,6 +155,7 @@ export class AssistantMessageComponent extends Container {
 								italic: true,
 							},
 							{
+								markSoftWraps: true,
 								transform: createMarkdownTransform(
 									"assistant-thinking",
 									this.isStreaming,

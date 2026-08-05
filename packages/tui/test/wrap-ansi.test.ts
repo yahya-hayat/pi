@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
+import { getSoftWrapSeparator, stripSoftWrapMarkers, visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
 describe("wrapTextWithAnsi", () => {
 	describe("underline styling", () => {
@@ -153,6 +153,24 @@ describe("wrapTextWithAnsi", () => {
 			for (const line of wrapped) {
 				assert.ok(visibleWidth(line) <= 40);
 			}
+		});
+
+		it("marks soft continuations with their exact source separator", () => {
+			const red = "\x1b[31m";
+			const reset = "\x1b[0m";
+			const wrapped = wrapTextWithAnsi(`${red}alpha  beta${reset}\n你好世界`, 6, { markSoftWraps: true });
+
+			assert.deepStrictEqual(wrapped.map(stripSoftWrapMarkers), [
+				`${red}alpha`,
+				`${red}beta${reset}`,
+				"你好世",
+				"界",
+			]);
+			assert.strictEqual(getSoftWrapSeparator(wrapped[0]!), undefined);
+			assert.strictEqual(getSoftWrapSeparator(wrapped[1]!), "  ");
+			assert.strictEqual(getSoftWrapSeparator(wrapped[2]!), undefined);
+			assert.strictEqual(getSoftWrapSeparator(wrapped[3]!), "");
+			assert.ok(wrapped.every((line) => visibleWidth(line) <= 6));
 		});
 
 		it("should ignore OSC 133 semantic markers in visible width", () => {
